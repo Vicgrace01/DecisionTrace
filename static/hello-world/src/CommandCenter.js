@@ -328,10 +328,14 @@ function CommandCenter() {
           disabled={isReviewing}
           placeholder="Explain the evidence and why this decision should be approved or rejected..."
           aria-describedby={`${reasonInputId}-help`}
-          onChange={(event) => setReviewReasons((current) => ({
-            ...current,
-            [page.id]: event.target.value,
-          }))}
+          onChange={(event) => {
+            // Capture the value before the state updater runs; React 16 pools synthetic events.
+            const value = event.currentTarget.value;
+            setReviewReasons((current) => ({
+              ...current,
+              [page.id]: value,
+            }));
+          }}
         />
         <div className="cc-review-reason-meta" id={`${reasonInputId}-help`}>
           <span>At least 20 characters. Maximum 1,000.</span>
