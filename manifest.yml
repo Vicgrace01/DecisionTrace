@@ -64,6 +64,7 @@ permissions:
   scopes:
     - read:jira-work
     - read:confluence-content.all
+    - read:page:confluence
     - read:confluence-space.summary
     - search:confluence
     - storage:app
@@ -81,3 +82,52 @@ app:
       required: false
 
   id: ari:cloud:ecosystem::app/ecf0a216-6e48-49ef-b6d6-f169dd7488ce
+
+  storage:
+    entities:
+      - name: decision-review-current
+        attributes:
+          decisionId:
+            type: string
+          schemaVersion:
+            type: integer
+          status:
+            type: string
+          reviewerAccountId:
+            type: string
+          sourceVersion:
+            type: integer
+          reason:
+            type: string
+          eventId:
+            type: string
+          reviewedAt:
+            type: string
+          revision:
+            type: integer
+      - name: decision-review-event
+        attributes:
+          decisionId:
+            type: string
+          schemaVersion:
+            type: integer
+          status:
+            type: string
+          reviewerAccountId:
+            type: string
+          sourceVersion:
+            type: integer
+          reason:
+            type: string
+          eventId:
+            type: string
+          reviewedAt:
+            type: string
+          revision:
+            type: integer
+        indexes:
+          - name: by-decision-revision
+            partition:
+              - decisionId
+            range:
+              - revision

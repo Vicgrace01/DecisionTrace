@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   createDecisionReviewRecord,
   effectiveDecisionReviewStatus,
+  isValidDecisionReviewRecord,
   validateDecisionReviewCommand,
 } from '../src/review-governance.js';
 
@@ -161,5 +162,68 @@ describe('decision review governance contract', () => {
       }),
       sourceVersion: 0,
     }, 7)).toBe('needs-review');
+  });
+});
+
+describe('complete review record validation', () => {
+  it('rejects a record with missing audit metadata', () => {
+    expect(isValidDecisionReviewRecord({
+      schemaVersion: 2,
+      decisionId: '5144577',
+      status: 'approved',
+      reviewerAccountId: 'reviewer-1',
+      sourceVersion: 7,
+      reason: validCommand.reason,
+    })).toBe(false);
+
+    expect(isValidDecisionReviewRecord({
+      schemaVersion: 2,
+      decisionId: '5144577',
+      status: 'needs-review',
+      reviewerAccountId: 'reviewer-1',
+      sourceVersion: 7,
+      reason: '',
+      eventId: 'evt-empty-reason',
+      reviewedAt: '2026-11-26T12:00:00.000Z',
+      revision: 1,
+    })).toBe(false);
+  });
+
+  it('rejects a record stored under a different decision key', () => {
+    const record = createDecisionReviewRecord(validCommand, {
+      eventId: 'evt-key-check',
+      reviewedAt: '2026-11-26T12:00:00.000Z',
+      revision: 1,
+    });
+    expect(isValidDecisionReviewRecord(record, '9999999')).toBe(false);
+    expect(effectiveDecisionReviewStatus(record, 7, '9999999')).toBe('needs-review');
+  });
+
+  it('accepts only complete version-bound records', () => {
+    const record = createDecisionReviewRecord(validCommand, {
+      eventId: 'evt-complete-record',
+      reviewedAt: '2026-11-26T12:00:00.000Z',
+      revision: 1,
+    });
+    expect(isValidDecisionReviewRecord(record, '5144577')).toBe(true);
+    expect(effectiveDecisionReviewStatus(record, 7, '5144577')).toBe('approved');
+    expect(effectiveDecisionReviewStatus(record, 8, '5144577')).toBe('needs-review');
+  });
+
+  it('stores a non-empty audit reason for a needs-review reset', () => {
+    const command = validateDecisionReviewCommand({
+      ...validCommand,
+      status: 'needs-review',
+      reason: '',
+    });
+    expect(command.reason).toBe('Review reset to needs-review.');
+  });
+
+  it('rejects revisions above the Custom Entity Store integer boundary', () => {
+    expect(() => createDecisionReviewRecord(validCommand, {
+      eventId: 'evt-revision-overflow',
+      reviewedAt: '2026-11-26T12:00:00.000Z',
+      revision: 2_147_483_648,
+    })).toThrow(/revision/);
   });
 });

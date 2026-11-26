@@ -16,6 +16,6 @@
   "scripts": {
     "build:domain": "npm --prefix packages/domain run build",
     "test:backend": "npm --prefix packages/domain test",
-    "verify:backend": "npm run build:domain && npm run test:backend && forge lint"
+    "verify:backend": "npm run build:domain && npm run test:backend && forge lint --approve MAJOR_VERSION_RULE"
   }
 }

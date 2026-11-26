@@ -1,7 +1,15 @@
 import Resolver from '@forge/resolver';
 import api, { route } from '@forge/api';
-import { kvs } from '@forge/kvs';
+import { kvs, Filter, FilterConditions, Sort } from '@forge/kvs';
+import { randomUUID } from 'node:crypto';
 import { mapJiraIssueToWorkItem } from '../packages/domain/dist/jira-adapter.js';
+import {
+  createDecisionReviewRecord,
+  effectiveDecisionReviewStatus,
+  isValidDecisionReviewRecord,
+  validateDecisionReviewCommand,
+} from '../packages/domain/dist/review-governance.js';
+import { resolveDecisionLifecycle } from '../packages/domain/dist/decision-lifecycle.js';
 import { extractClaims, detectFlags } from '../packages/domain/dist/supersession.js';
 import { isDecisionCandidate } from '../packages/domain/dist/candidate-filter.js';
 import {
@@ -31,7 +39,9 @@ async function getJiraSiteBaseUrl() {
   }
   return parsedBaseUrl.origin;
 }
-const REVIEW_STORAGE_KEY = 'decisiontrace:decision-reviews:v1';
+const CURRENT_REVIEW_ENTITY = 'decision-review-current';
+const REVIEW_EVENT_ENTITY = 'decision-review-event';
+const MAX_REVIEW_HISTORY_PAGE_SIZE = 100;
 const JIRA_FIELDS = [
   'summary',
   'description',
@@ -113,7 +123,7 @@ async function searchConfluenceDecisions() {
     if (!isDecisionCandidate(title, text, claims)) return [];
 
     const statusMatch = text.match(
-      /(?:^|\n)\s*status\s*[:\-]\s*(active|approved|proposed|superseded|retired)\b/im
+      /(?:^|\n)\s*status\s*[:\-]\s*(active|approved|proposed|superseded|retired|revoked|reversed)\b/im
     );
 
     return [{
@@ -122,6 +132,7 @@ async function searchConfluenceDecisions() {
       url: decision.sourceUrl,
       spaceKey: page.space?.key ?? 'Unknown space',
       updatedAt: page.version?.when ?? null,
+      sourceVersion: Number.isSafeInteger(page.version?.number) ? page.version.number : null,
       preview: body.slice(0, 600),
       declaredStatus: statusMatch ? statusMatch[1].toLowerCase() : 'unspecified',
       supersedes: [...text.matchAll(/(?:^|\n)\s*supersedes(?:\s+decision)?\s*[:#-]\s*(?:page\s*)?(\d+)\b/gim)].map((match) => String(match[1])),
@@ -335,9 +346,152 @@ async function fetchJiraIssuesForDecisions(pages) {
   };
 }
 
-async function readReviewRecords() {
-  const stored = await kvs.get(REVIEW_STORAGE_KEY);
-  return stored && typeof stored === 'object' && !Array.isArray(stored) ? stored : {};
+async function readCurrentDecisionReview(decisionId) {
+  return kvs.entity(CURRENT_REVIEW_ENTITY).get(String(decisionId));
+}
+
+/**
+ * Attach only the current effective review state to discovered pages. Review
+ * details and rationale are exposed only by the access-controlled history API.
+ */
+async function attachReviewStatuses(pages) {
+  return Promise.all(pages.map(async (page) => {
+    const decisionId = String(page.id);
+    const record = await readCurrentDecisionReview(decisionId);
+    const validRecord = isValidDecisionReviewRecord(record, decisionId);
+
+    return {
+      ...page,
+      reviewStatus: effectiveDecisionReviewStatus(
+        record,
+        page.sourceVersion,
+        decisionId
+      ),
+      reviewedAt: validRecord ? record.reviewedAt : null,
+      reviewSourceVersion: validRecord ? record.sourceVersion : null,
+      staleApproval: Boolean(
+        validRecord &&
+        record.status === 'approved' &&
+        Number.isSafeInteger(page.sourceVersion) &&
+        record.sourceVersion !== page.sourceVersion
+      ),
+    };
+  }));
+}
+
+function requireAuthenticatedAccountId(req) {
+  const accountId = typeof req?.context?.accountId === 'string'
+    ? req.context.accountId.trim()
+    : '';
+  const accountType = req?.context?.accountType;
+
+  // Forge represents anonymous users with the shared account ID `unidentified`.
+  // That value must never be persisted as an individual reviewer identity.
+  if (!accountId || accountId === 'unidentified' || accountType === 'anonymous') {
+    throw new Error('An authenticated Atlassian user is required for this operation.');
+  }
+  return accountId;
+}
+
+/**
+ * Fetch a page as the interacting user. Editing permission is checked through
+ * Confluence's permitted-operations endpoint before any review is accepted.
+ */
+async function getConfluencePageForCurrentUser(decisionId, { requireEdit = false } = {}) {
+  const pageResponse = await api.asUser().requestConfluence(
+    route`/wiki/api/v2/pages/${decisionId}?body-format=storage&include-version=true`
+  );
+
+  if (pageResponse.status === 401 || pageResponse.status === 403) {
+    throw new Error('The current user cannot view this Confluence decision page.');
+  }
+  if (pageResponse.status === 404) {
+    throw new Error('The Confluence decision page does not exist or is not visible to the current user.');
+  }
+  if (!pageResponse.ok) {
+    throw new Error(`Could not verify the Confluence decision page (HTTP ${pageResponse.status}).`);
+  }
+
+  const page = await pageResponse.json();
+  if (String(page?.id ?? '') !== decisionId) {
+    throw new Error('Confluence returned a different page than the requested decision.');
+  }
+  if (String(page?.status ?? '').toLowerCase() !== 'current') {
+    throw new Error('Only a current Confluence page can be reviewed.');
+  }
+
+  // The resolver is the trust boundary: do not rely on the Command Center
+  // filtering alone. Re-run the same candidate rules used by discovery.
+  const title = typeof page?.title === 'string' ? page.title.trim() : '';
+  const body = storageToText(page?.body?.storage?.value ?? '');
+  const text = `${title}\n${body}`.trim();
+  const candidateDecision = {
+    id: `confluence-${decisionId}`,
+    sourceType: 'confluence-page',
+    sourceUrl: '',
+    title,
+    text,
+    status: 'proposed',
+    claims: [],
+    createdAt: '',
+  };
+  const claims = extractClaims(candidateDecision);
+  if (!title || !isDecisionCandidate(title, text, claims)) {
+    throw new Error('Only Confluence pages that qualify as DecisionTrace decision candidates can be reviewed.');
+  }
+
+  const sourceVersion = page?.version?.number;
+  if (
+    typeof sourceVersion !== 'number' ||
+    !Number.isSafeInteger(sourceVersion) ||
+    sourceVersion < 1
+  ) {
+    throw new Error('Confluence did not return a verifiable current page version.');
+  }
+
+  if (requireEdit) {
+    const operationsResponse = await api.asUser().requestConfluence(
+      route`/wiki/api/v2/pages/${decisionId}/operations`
+    );
+
+    if (operationsResponse.status === 401 || operationsResponse.status === 403) {
+            throw new Error(
+        `Page edit permission could not be verified because Confluence returned HTTP ${operationsResponse.status}.`
+      );
+    }
+    if (!operationsResponse.ok) {
+      throw new Error(`Confluence page-edit permission could not be verified (HTTP ${operationsResponse.status}).`);
+    }
+
+    const permissionData = await operationsResponse.json();
+    const operations = Array.isArray(permissionData?.operations)
+      ? permissionData.operations
+      : Array.isArray(permissionData?.operations?.results)
+        ? permissionData.operations.results
+        : null;
+
+    if (!operations) {
+      throw new Error('Confluence did not return a verifiable page permission list.');
+    }
+
+    const canUpdatePage = operations.some((item) =>
+      String(item?.operation ?? '').toLowerCase() === 'update' &&
+      String(item?.targetType ?? '').toLowerCase() === 'page'
+    );
+
+    if (!canUpdatePage) {
+      throw new Error('You need Confluence edit permission on this decision page to submit a review.');
+    }
+  }
+
+  return { page, sourceVersion };
+}
+
+async function attachReviewStatusesToDiscovery(discovery) {
+  return {
+    ...discovery,
+    pages: await attachReviewStatuses(discovery.pages),
+  };
 }
 
 function applySupersessionRelationships(pages) {
@@ -369,17 +523,17 @@ function applySupersessionRelationships(pages) {
 }
 
 function toGraphDecision(page) {
-  const approvalState = page.reviewStatus === 'approved'
-    ? 'approved'
-    : page.reviewStatus === 'rejected'
-      ? 'rejected'
-      : 'unverified';
+  const lifecycle = resolveDecisionLifecycle({
+    declaredStatus: page.declaredStatus,
+    derivedStatus: page.derivedStatus,
+    reviewStatus: page.reviewStatus,
+  });
 
   return {
     id: String(page.id),
     title: page.title,
-    status: page.derivedStatus ?? page.declaredStatus,
-    approvalState,
+    status: lifecycle.status,
+    approvalState: lifecycle.approvalState,
     sourceUrl: page.url,
     supersedes: (page.supersedes ?? []).map(String),
     claims: (page.claims ?? []).map((claim) => ({
@@ -409,9 +563,15 @@ function toGraphWorkItem(issue, siteBase) {
 }
 
 function toFlagDecision(page) {
-  const status = page.derivedStatus === 'superseded' || page.declaredStatus === 'superseded' || page.declaredStatus === 'retired'
+  const lifecycle = resolveDecisionLifecycle({
+    declaredStatus: page.declaredStatus,
+    derivedStatus: page.derivedStatus,
+    reviewStatus: page.reviewStatus,
+  });
+  // Only a current human approval may activate claims in the flag engine.
+  const status = lifecycle.status === 'superseded'
     ? 'superseded'
-    : page.reviewStatus === 'approved' || page.declaredStatus === 'active' || page.declaredStatus === 'approved'
+    : lifecycle.authoritative
       ? 'active'
       : 'proposed';
 
@@ -436,20 +596,14 @@ function toFlagDecision(page) {
 }
 
 resolver.define('scanConfluenceDecisions', async () => {
-  return searchConfluenceDecisions();
+  const discovery = await searchConfluenceDecisions();
+  return attachReviewStatusesToDiscovery(discovery);
 });
 
 resolver.define('getDecisionGraph', async () => {
   const discovery = await searchConfluenceDecisions();
-  const reviewRecords = await readReviewRecords();
-  const pages = applySupersessionRelationships(discovery.pages.map((page) => {
-    const review = reviewRecords[page.id];
-    return {
-      ...page,
-      reviewStatus: review?.status ?? 'needs-review',
-      reviewedAt: review?.updatedAt ?? null,
-    };
-  }));
+  const reviewedDiscovery = await attachReviewStatusesToDiscovery(discovery);
+  const pages = applySupersessionRelationships(reviewedDiscovery.pages);
 
   const jiraSiteBaseUrl = await getJiraSiteBaseUrl();
   const jiraResult = await fetchJiraIssuesForDecisions(pages);
@@ -623,39 +777,173 @@ resolver.define('diagnoseJiraIssue', async (req) => {
   };
 });
 resolver.define('setDecisionReview', async (req) => {
-  const payload = req.payload ?? {};
-  const decisionId = String(payload.decisionId ?? '').trim();
-  const status = String(payload.status ?? '').trim();
+  // Never trust reviewer identity or page version supplied by the client.
+  const reviewerAccountId = requireAuthenticatedAccountId(req);
+  const payload = req?.payload && typeof req.payload === 'object' && !Array.isArray(req.payload)
+    ? req.payload
+    : {};
+  const decisionId = typeof payload.decisionId === 'string'
+    ? payload.decisionId.trim()
+    : '';
 
   if (!/^\d{1,30}$/.test(decisionId)) {
     throw new Error('A valid Confluence page ID is required.');
   }
-  if (!['approved', 'rejected', 'needs-review'].includes(status)) {
-    throw new Error('Review status must be approved, rejected or needs-review.');
+
+  const { sourceVersion } = await getConfluencePageForCurrentUser(decisionId, {
+    requireEdit: true,
+  });
+
+  const command = validateDecisionReviewCommand({
+    decisionId,
+    status: payload.status,
+    reviewerAccountId,
+    sourceVersion,
+    reason: typeof payload.reason === 'string' ? payload.reason : '',
+  });
+
+  const currentEntity = kvs.entity(CURRENT_REVIEW_ENTITY);
+  const currentRecord = await currentEntity.get(decisionId);
+  if (
+    currentRecord !== undefined &&
+    currentRecord !== null &&
+    !isValidDecisionReviewRecord(currentRecord, decisionId)
+  ) {
+    throw new Error('The current review record is malformed. No new review was saved.');
   }
 
-  const records = await readReviewRecords();
-  if (status === 'needs-review') {
-    delete records[decisionId];
-  } else {
-    records[decisionId] = {
-      status,
-      updatedAt: new Date().toISOString(),
-    };
+  const expectedRevision = currentRecord?.revision ?? 0;
+  if (
+    typeof expectedRevision !== 'number' ||
+    !Number.isSafeInteger(expectedRevision) ||
+    expectedRevision < 0 ||
+    expectedRevision >= 2_147_483_647
+  ) {
+    throw new Error('The review revision is invalid or has reached its storage limit.');
   }
 
-  const boundedRecords = Object.fromEntries(
-    Object.entries(records)
-      .sort((a, b) => String(b[1]?.updatedAt ?? '').localeCompare(String(a[1]?.updatedAt ?? '')))
-      .slice(0, 250)
-  );
+  const record = createDecisionReviewRecord(command, {
+    eventId: randomUUID(),
+    reviewedAt: new Date().toISOString(),
+    revision: expectedRevision + 1,
+  });
 
-  await kvs.set(REVIEW_STORAGE_KEY, boundedRecords);
+  const currentConditions = currentRecord
+    ? new Filter().and('revision', FilterConditions.equalTo(expectedRevision))
+    : new Filter().and('revision', FilterConditions.notExists());
+  const eventKey = `${decisionId}:${record.eventId}`;
+
+  const successResult = {
+    ok: true,
+    decisionId,
+    status: record.status,
+    sourceVersion: record.sourceVersion,
+    reviewedAt: record.reviewedAt,
+    revision: record.revision,
+    eventId: record.eventId,
+  };
+
+  try {
+    // The current state update and immutable event append are committed or
+    // rolled back together. A competing revision makes the whole write fail.
+    await kvs.transact()
+      .set(decisionId, record, {
+        entityName: CURRENT_REVIEW_ENTITY,
+        conditions: currentConditions,
+      })
+      .set(eventKey, record, {
+        entityName: REVIEW_EVENT_ENTITY,
+        conditions: new Filter().and('eventId', FilterConditions.notExists()),
+      })
+      .execute();
+  } catch {
+    // The event is immutable. Check it directly first because another reviewer
+    // may have advanced the current record after this transaction committed.
+    const eventRead = await Promise.allSettled([
+      kvs.entity(REVIEW_EVENT_ENTITY).get(eventKey),
+      currentEntity.get(decisionId),
+    ]);
+    const persistedEvent = eventRead[0].status === 'fulfilled' ? eventRead[0].value : null;
+    const latestRecord = eventRead[1].status === 'fulfilled' ? eventRead[1].value : null;
+
+    if (persistedEvent?.eventId === record.eventId || latestRecord?.eventId === record.eventId) {
+      return successResult;
+    }
+    if (eventRead.every((result) => result.status === 'rejected')) {
+      throw new Error('Review storage could not confirm the transaction. No review success is reported.');
+    }
+    if (eventRead[1].status === 'fulfilled' && (latestRecord?.revision ?? 0) !== expectedRevision) {
+      throw new Error('Another reviewer saved a newer review. Reload the decision and submit again.');
+    }
+    if (eventRead.some((result) => result.status === 'rejected')) {
+      throw new Error('Review storage could not fully confirm the transaction. No review success is reported.');
+    }
+    throw new Error('The review could not be saved. No review success is reported.');
+  }
+
+  return successResult;
+});
+
+resolver.define('getDecisionReviewHistory', async (req) => {
+  requireAuthenticatedAccountId(req);
+  const payload = req?.payload && typeof req.payload === 'object' && !Array.isArray(req.payload)
+    ? req.payload
+    : {};
+  const decisionId = typeof payload.decisionId === 'string'
+    ? payload.decisionId.trim()
+    : '';
+
+  if (!/^\d{1,30}$/.test(decisionId)) {
+    throw new Error('A valid Confluence page ID is required.');
+  }
+
+  // The source page is fetched as the current user before returning its history.
+  const { sourceVersion } = await getConfluencePageForCurrentUser(decisionId);
+
+  const requestedLimit = payload.limit === undefined ? 20 : Number(payload.limit);
+  if (!Number.isSafeInteger(requestedLimit) || requestedLimit < 1) {
+    throw new Error('History page size must be a positive integer.');
+  }
+  const limit = Math.min(requestedLimit, MAX_REVIEW_HISTORY_PAGE_SIZE);
+  const cursor = payload.cursor === undefined || payload.cursor === null
+    ? ''
+    : typeof payload.cursor === 'string'
+      ? payload.cursor
+      : '';
+  if (payload.cursor !== undefined && payload.cursor !== null && (!cursor || cursor.length > 4096)) {
+    throw new Error('The review-history cursor is invalid.');
+  }
+
+  let query = kvs.entity(REVIEW_EVENT_ENTITY)
+    .query()
+    .index('by-decision-revision', { partition: [decisionId] })
+    .sort(Sort.DESC)
+    .limit(limit);
+
+  if (cursor) query = query.cursor(cursor);
+
+  const page = await query.getMany();
+  const events = (page.results ?? [])
+    .map((entry) => entry?.value)
+    .filter((record) => isValidDecisionReviewRecord(record, decisionId))
+    .map((record) => ({
+      decisionId: record.decisionId,
+      status: record.status,
+      reviewerAccountId: record.reviewerAccountId,
+      sourceVersion: record.sourceVersion,
+      reason: record.reason,
+      eventId: record.eventId,
+      reviewedAt: record.reviewedAt,
+      revision: record.revision,
+    }));
+
   return {
     ok: true,
     decisionId,
-    status,
-    updatedAt: boundedRecords[decisionId]?.updatedAt ?? null,
+    currentSourceVersion: sourceVersion,
+    events,
+    nextCursor: page.nextCursor ?? null,
+    hasMore: Boolean(page.nextCursor),
   };
 });
 
@@ -834,15 +1122,8 @@ export async function checkDecisionValidity(payload = {}, actionContext = {}) {
 
   const issue = await issueResponse.json();
   const discovery = await searchConfluenceDecisions();
-  const reviewRecords = await readReviewRecords();
-  const pages = applySupersessionRelationships(discovery.pages.map((page) => {
-    const review = reviewRecords[String(page.id)];
-    return {
-      ...page,
-      reviewStatus: review?.status ?? 'needs-review',
-      reviewedAt: review?.updatedAt ?? null,
-    };
-  }));
+  const reviewedDiscovery = await attachReviewStatusesToDiscovery(discovery);
+  const pages = applySupersessionRelationships(reviewedDiscovery.pages);
 
   const decisions = pages.map(toGraphDecision);
   const workItem = mapJiraIssueToWorkItem(issue);
@@ -867,18 +1148,25 @@ export async function checkDecisionValidity(payload = {}, actionContext = {}) {
     .map((link) => {
       const page = pagesById.get(String(link.decisionId));
       const decision = graph.decisions.find((item) => item.id === String(link.decisionId));
-      const currentStatus = String(page?.derivedStatus ?? page?.declaredStatus ?? 'unspecified').toLowerCase();
+      const sourceDecisionStatus = String(page?.derivedStatus ?? page?.declaredStatus ?? 'unspecified').toLowerCase();
       const reviewStatus = page?.reviewStatus ?? 'needs-review';
-      const superseded = currentStatus === 'superseded' || currentStatus === 'retired' || currentStatus === 'revoked';
+      const lifecycle = resolveDecisionLifecycle({
+        declaredStatus: page?.declaredStatus,
+        derivedStatus: page?.derivedStatus,
+        reviewStatus,
+      });
+      const superseded = lifecycle.superseded;
       const humanApproved = reviewStatus === 'approved';
-      const rejected = reviewStatus === 'rejected';
-      const activeBySourceStatus = currentStatus === 'active' || currentStatus === 'approved';
-      const authoritative = humanApproved && activeBySourceStatus && !superseded;
+      const rejected = lifecycle.rejected;
+      const authoritative = lifecycle.authoritative;
       return {
         decisionId: String(link.decisionId),
         decisionTitle: page?.title ?? decision?.title ?? 'Unknown decision',
-        decisionStatus: currentStatus,
+        decisionStatus: lifecycle.status,
+        sourceDecisionStatus,
         reviewerStatus: reviewStatus,
+        staleApproval: Boolean(page?.staleApproval),
+        priorReviewSourceVersion: page?.reviewSourceVersion ?? null,
         humanApproved,
         rejected,
         authoritative,
@@ -893,7 +1181,11 @@ export async function checkDecisionValidity(payload = {}, actionContext = {}) {
 
   const activeApproved = evidenceMatches.filter((item) => item.authoritative);
   const staleApproved = evidenceMatches.filter((item) => item.humanApproved && item.superseded);
-  const unverified = evidenceMatches.filter((item) => !item.authoritative && !item.humanApproved && !item.rejected);
+  const staleApprovalMatches = evidenceMatches.filter((item) => item.staleApproval);
+  const rejectedMatches = evidenceMatches.filter((item) => item.rejected && !item.superseded);
+  const unverified = evidenceMatches.filter((item) =>
+    !item.authoritative && !item.rejected && !item.superseded
+  );
   const excludedMentions = evidenceMatches.filter((item) =>
     item.relationship === 'mentions-excluded-option' || item.relationship === 'mixed-or-ambiguous'
   );
@@ -902,6 +1194,8 @@ export async function checkDecisionValidity(payload = {}, actionContext = {}) {
   let outcome = 'NO_DECISION_MATCH';
   if (currentExclusionNeedsReview) outcome = 'HUMAN_REVIEW_REQUIRED';
   else if (staleApproved.length > 0) outcome = 'POTENTIALLY_STALE_DECISION';
+  else if (staleApprovalMatches.length > 0) outcome = 'STALE_APPROVAL_REQUIRES_REVIEW';
+  else if (rejectedMatches.length > 0) outcome = 'REJECTED_DECISION_MATCH';
   else if (activeApproved.some((item) => item.relationship === 'mentions-selected-option')) outcome = 'ALIGNED_WITH_APPROVED_DECISION_SIGNAL';
   else if (unverified.length > 0) outcome = 'UNVERIFIED_DECISION_CANDIDATE_MATCH';
 
@@ -925,6 +1219,8 @@ export async function checkDecisionValidity(payload = {}, actionContext = {}) {
     summary: {
       approvedActiveMatches: activeApproved.length,
       approvedSupersededMatches: staleApproved.length,
+      staleApprovalMatches: staleApprovalMatches.length,
+      rejectedMatches: rejectedMatches.length,
       unverifiedCandidateMatches: unverified.length,
       excludedOptionOrAmbiguousMentions: excludedMentions.length,
     },
@@ -932,7 +1228,9 @@ export async function checkDecisionValidity(payload = {}, actionContext = {}) {
       POTENTIALLY_STALE_DECISION: 'The issue matches a reviewer-approved decision that has been superseded. Treat this as a stale-decision signal and inspect whether the work still implements the old choice.',
       HUMAN_REVIEW_REQUIRED: 'The issue mentions an excluded option or has mixed evidence. This is not proof of a violation; a human must inspect whether the work is remediation, migration or continued implementation.',
       ALIGNED_WITH_APPROVED_DECISION_SIGNAL: 'The issue contains evidence matching an active, reviewer-approved selected option. This is an alignment signal, not proof that implementation is complete or correct.',
-      UNVERIFIED_DECISION_CANDIDATE_MATCH: 'The issue matches a decision candidate that has not been approved by a human reviewer. Do not treat it as authoritative.',
+      STALE_APPROVAL_REQUIRES_REVIEW: 'The decision page has changed since it was approved. The earlier approval is no longer authoritative; a human must review the current source version.',
+      REJECTED_DECISION_MATCH: 'The issue matches a decision that a human reviewer explicitly rejected. Do not treat it as an approved or authoritative decision.',
+      UNVERIFIED_DECISION_CANDIDATE_MATCH: 'The issue matches a decision candidate that has not been approved by a human reviewer for its current source version. Do not treat it as authoritative.',
       NO_DECISION_MATCH: 'No extracted decision claim matched this issue. This does not prove that the issue is unrelated.',
     },
     safety: {

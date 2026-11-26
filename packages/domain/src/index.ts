@@ -7,3 +7,4 @@ export type { BlastRadiusInput } from './blast-radius.js';
 export { mapJiraIssueToWorkItem } from './jira-adapter.js';
 export * from './decision-graph';
 export * from './review-governance.js';
+export * from './decision-lifecycle.js';

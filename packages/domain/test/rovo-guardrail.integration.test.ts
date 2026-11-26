@@ -1,9 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { mockRequestJira, mockRequestConfluence, mockKvsGet } = vi.hoisted(() => ({
+const { mockRequestJira, mockRequestConfluence, mockKvsEntityGet, mockReviewRecords } = vi.hoisted(() => ({
   mockRequestJira: vi.fn(),
   mockRequestConfluence: vi.fn(),
-  mockKvsGet: vi.fn(),
+  mockKvsEntityGet: vi.fn(),
+  mockReviewRecords: {},
 }));
 
 vi.mock('@forge/resolver', () => ({
@@ -27,7 +28,13 @@ vi.mock('@forge/api', () => ({
 }));
 
 vi.mock('@forge/kvs', () => ({
-  kvs: { get: mockKvsGet },
+  kvs: { entity: () => ({ get: mockKvsEntityGet }) },
+  Filter: class Filter { and() { return this; } },
+  FilterConditions: {
+    equalTo: (value) => ({ type: 'equalTo', value }),
+    notExists: () => ({ type: 'notExists' }),
+  },
+  Sort: { ASC: 'ASC', DESC: 'DESC' },
 }));
 
 import { checkDecisionValidity } from '../../../src/index.js';
@@ -81,7 +88,7 @@ const makeDecisionPage = ({
     id,
     title: 'Decision: Authentication Provider',
     body: { storage: { value: statements.join('') } },
-    version: { when: '2026-11-25T10:00:00.000Z' },
+    version: { number: 7, when: '2026-11-25T10:00:00.000Z' },
     space: { key: 'AUTH' },
     _links: { webui: `/spaces/AUTH/pages/${id}` },
   };
@@ -97,7 +104,21 @@ const configureScenario = ({
     results: pages,
     _links: { base: 'https://example.atlassian.net/wiki' },
   }));
-  mockKvsGet.mockResolvedValue(reviews);
+  for (const key of Object.keys(mockReviewRecords)) delete mockReviewRecords[key];
+  for (const [decisionId, review] of Object.entries(reviews)) {
+    mockReviewRecords[decisionId] = {
+      schemaVersion: 2,
+      decisionId,
+      status: review.status,
+      reviewerAccountId: 'trusted-test-reviewer',
+      sourceVersion: review.sourceVersion ?? 7,
+      reason: review.reason ?? 'Human review completed against this decision.',
+      eventId: review.eventId ?? `test-event-${decisionId}`,
+      reviewedAt: review.updatedAt ?? '2026-11-25T11:00:00.000Z',
+      revision: review.revision ?? 1,
+    };
+  }
+  mockKvsEntityGet.mockImplementation(async (decisionId) => mockReviewRecords[String(decisionId)]);
 };
 
 beforeEach(() => {
@@ -189,6 +210,56 @@ describe('DecisionTrace actual Rovo action handler', () => {
     expect(result.outcome).toBe('UNVERIFIED_DECISION_CANDIDATE_MATCH');
     expect(result.summary.approvedActiveMatches).toBe(0);
     expect(result.decisionMatches[0].authoritative).toBe(false);
+  });
+
+  it('does not promote a rejected Active page into an authoritative decision', async () => {
+    configureScenario({
+      pages: [makeDecisionPage({ status: 'Active' })],
+      reviews: {
+        '5144577': {
+          status: 'rejected',
+          reason: 'Security review has not approved the selected provider.',
+        },
+      },
+    });
+
+    const result = await checkDecisionValidity({ issueKey: 'AUTH-101' });
+    expect(result.outcome).toBe('REJECTED_DECISION_MATCH');
+    expect(result.summary.rejectedMatches).toBe(1);
+    expect(result.summary.approvedActiveMatches).toBe(0);
+    expect(result.decisionMatches[0].rejected).toBe(true);
+    expect(result.decisionMatches[0].authoritative).toBe(false);
+    expect(result.decisionMatches[0].decisionStatus).toBe('rejected');
+  });
+
+  it('invalidates an approval when the Confluence source version changes', async () => {
+    configureScenario({ reviews: { '5144577': { status: 'approved', sourceVersion: 6 } } });
+    const result = await checkDecisionValidity({ issueKey: 'AUTH-101' });
+    expect(result.outcome).toBe('STALE_APPROVAL_REQUIRES_REVIEW');
+    expect(result.summary.staleApprovalMatches).toBe(1);
+    expect(result.decisionMatches[0].reviewerStatus).toBe('needs-review');
+    expect(result.decisionMatches[0].staleApproval).toBe(true);
+    expect(result.decisionMatches[0].authoritative).toBe(false);
+  });
+
+  it('classifies an approved but still-proposed page as unverified in Rovo', async () => {
+    configureScenario({
+      pages: [makeDecisionPage({ status: 'Proposed' })],
+      reviews: {
+        '5144577': {
+          status: 'approved',
+          reason: 'The reviewer approved the record but the source remains proposed.',
+        },
+      },
+    });
+
+    const result = await checkDecisionValidity({ issueKey: 'AUTH-101' });
+    expect(result.outcome).toBe('UNVERIFIED_DECISION_CANDIDATE_MATCH');
+    expect(result.summary.unverifiedCandidateMatches).toBe(1);
+    expect(result.summary.approvedActiveMatches).toBe(0);
+    expect(result.decisionMatches[0].humanApproved).toBe(true);
+    expect(result.decisionMatches[0].authoritative).toBe(false);
+    expect(result.decisionMatches[0].decisionStatus).toBe('proposed');
   });
 
   it('returns ISSUE_NOT_FOUND_OR_NOT_VISIBLE for a Jira 404', async () => {
