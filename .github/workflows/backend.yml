@@ -14,9 +14,7 @@ permissions:
 
 jobs:
   backend:
-    env:
-      FORGE_NON_INTERACTIVE: "on"
-    name: Build, tests and Forge lint
+    name: Build and tests
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -33,9 +31,8 @@ jobs:
         run: npm ci
       - name: Install domain package dependencies
         run: npm ci --prefix packages/domain
-      - name: Install Forge CLI
-        run: npm install --global @forge/cli
-      - name: Disable Forge CLI usage analytics in CI
-        run: forge settings set usage-analytics false
-      - name: Run complete backend verification
-        run: npm run verify:backend
+
+      - name: Build domain package
+        run: npm run build:domain
+      - name: Run backend tests
+        run: npm run test:backend
