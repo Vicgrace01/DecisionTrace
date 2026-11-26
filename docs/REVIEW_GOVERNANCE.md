@@ -45,6 +45,8 @@ The shared domain lifecycle helper applies consistent rules to graph constructio
 
 The granular `read:page:confluence` scope and Custom Entity Store entities/index require a Forge deployment and app upgrade before the new resolver paths are available in an installed environment. Forge index creation runs asynchronously after deployment; history queries should not be relied on until the index is ready. No deployment, installation upgrade or data migration is performed by this sprint.
 
-## Existing UI integration caveat
+## Command Center review workflow
 
-The current Command Center calls `setDecisionReview` with only `decisionId` and `status`. This backend now requires a meaningful `reason` for `approved` and `rejected` reviews. The current approve/reject buttons will therefore receive a validation error until a follow-up UI change collects and submits a rationale. The `needs-review`/Reopen action remains callable without a user-entered rationale; the backend records the explicit reset reason. UI changes are intentionally outside this backend sprint and must be completed before enabling the stricter review flow for end users.
+The Command Center collects a reviewer rationale before enabling approval or rejection. It enforces the same 20-character minimum and 1,000-character maximum as the resolver, then submits the rationale with the decision ID and requested status. The input is retained after a failed submission and cleared only after a successful write. Reopening a decision does not require free-text rationale; the backend records its explicit reset reason.
+
+The Command Center can load audit history for a decision and page through events using the resolver's opaque cursor. Each event displays its review status, revision, timestamp, rationale, reviewer account identifier (partially masked), and Confluence source version. The current Confluence page version is shown alongside the events so older version-bound reviews are identifiable. History remains permission-scoped by the resolver and is not treated as the strongly consistent current review record.

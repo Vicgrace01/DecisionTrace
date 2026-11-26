@@ -27,10 +27,17 @@ jobs:
           cache-dependency-path: |
             package-lock.json
             packages/domain/package-lock.json
+            static/hello-world/package-lock.json
       - name: Install Forge app dependencies
         run: npm ci
       - name: Install domain package dependencies
         run: npm ci --prefix packages/domain
+      - name: Install Custom UI dependencies
+        run: npm ci --legacy-peer-deps --prefix static/hello-world
+      - name: Build Custom UI resource
+        run: npm run build --prefix static/hello-world
+        env:
+          NODE_OPTIONS: --openssl-legacy-provider
 
       - name: Build domain package
         run: npm run build:domain

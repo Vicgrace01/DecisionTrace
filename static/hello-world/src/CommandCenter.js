@@ -125,7 +125,11 @@ function CommandCenter() {
   const [query, setQuery] = useState('');
   const [loading, setLoading] = useState(false);
   const [reviewingId, setReviewingId] = useState('');
-  const [error, setError] = useState('');
+  const [reviewReasons, setReviewReasons] = useState({});
+  const [reviewHistory, setReviewHistory] = useState({});
+  const [historyOpenId, setHistoryOpenId] = useState('');
+  const [historyLoadingId, setHistoryLoadingId] = useState('');
+  const [historyErrors, setHistoryErrors] = useState({});  const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [diagnosticIssueKey, setDiagnosticIssueKey] = useState('LEO-23');
   const [diagnosticLoading, setDiagnosticLoading] = useState(false);
@@ -186,11 +190,35 @@ function CommandCenter() {
   };
 
   const updateReview = async (decisionId, status) => {
+    const reason = status === 'needs-review'
+      ? ''
+      : String(reviewReasons[decisionId] ?? '').trim();
+
+    if (status !== 'needs-review' && (reason.length < 20 || reason.length > 1000)) {
+      setError('Enter a review rationale of at least 20 characters and no more than 1,000 characters.');
+      return;
+    }
+
     setReviewingId(decisionId);
     setError('');
     setNotice('');
     try {
-      await invoke('setDecisionReview', { decisionId, status });
+      await invoke('setDecisionReview', {
+        decisionId,
+        status,
+        ...(status === 'needs-review' ? {} : { reason }),
+      });
+      setReviewReasons((current) => {
+        const next = { ...current };
+        delete next[decisionId];
+        return next;
+      });
+      setReviewHistory((current) => {
+        const next = { ...current };
+        delete next[decisionId];
+        return next;
+      });
+      setHistoryErrors((current) => ({ ...current, [decisionId]: '' }));
       setNotice(status === 'approved'
         ? 'Decision approved for use in DecisionTrace analysis. The Confluence source was not changed.'
         : status === 'rejected'
@@ -233,21 +261,146 @@ function CommandCenter() {
       });
     return () => { active = false; };
   }, []);
-  const renderReviewActions = (page) => (
-    <div className="cc-review-actions">
-      <button className="cc-review-button approve" disabled={reviewingId === page.id} onClick={() => updateReview(page.id, 'approved')}>
-        Approve decision
-      </button>
-      <button className="cc-review-button reject" disabled={reviewingId === page.id} onClick={() => updateReview(page.id, 'rejected')}>
-        Reject candidate
-      </button>
-      {page.reviewStatus !== 'needs-review' && (
-        <button className="cc-review-button reopen" disabled={reviewingId === page.id} onClick={() => updateReview(page.id, 'needs-review')}>
-          Reopen
-        </button>
-      )}
-    </div>
-  );
+  const loadReviewHistory = async (decisionId, cursor = null) => {
+    setHistoryLoadingId(decisionId);
+    setHistoryErrors((current) => ({ ...current, [decisionId]: '' }));
+    try {
+      const result = await invoke('getDecisionReviewHistory', {
+        decisionId,
+        limit: 20,
+        ...(cursor ? { cursor } : {}),
+      });
+      setReviewHistory((current) => {
+        const existing = cursor ? (current[decisionId]?.events ?? []) : [];
+        const byEventId = new Map(existing.map((event) => [event.eventId, event]));
+        for (const event of result.events ?? []) byEventId.set(event.eventId, event);
+        return {
+          ...current,
+          [decisionId]: {
+            events: [...byEventId.values()],
+            nextCursor: result.nextCursor ?? null,
+            hasMore: Boolean(result.hasMore),
+            currentSourceVersion: result.currentSourceVersion,
+          },
+        };
+      });
+    } catch (err) {
+      setHistoryErrors((current) => ({
+        ...current,
+        [decisionId]: err?.message || 'Could not load review history.',
+      }));
+    } finally {
+      setHistoryLoadingId('');
+    }
+  };
+
+  const toggleReviewHistory = (decisionId) => {
+    if (historyOpenId === decisionId) {
+      setHistoryOpenId('');
+      return;
+    }
+    setHistoryOpenId(decisionId);
+    if (!reviewHistory[decisionId]) loadReviewHistory(decisionId);
+  };
+
+  const renderReviewActions = (page) => {
+    const reason = reviewReasons[page.id] ?? '';
+    const reasonLength = reason.trim().length;
+    const reasonValid = reasonLength >= 20 && reasonLength <= 1000;
+    const isReviewing = reviewingId === page.id;
+    const reasonInputId = `cc-review-reason-${page.id}`;
+    const history = reviewHistory[page.id];
+    const historyOpen = historyOpenId === page.id;
+    const historyLoading = historyLoadingId === page.id;
+
+    return (
+      <div className="cc-review-action-panel">
+        <label className="cc-review-reason-label" htmlFor={reasonInputId}>
+          <span>REVIEW RATIONALE</span>
+          <small>Required for approval or rejection</small>
+        </label>
+        <textarea
+          id={reasonInputId}
+          className="cc-review-reason"
+          value={reason}
+          rows={3}
+          maxLength={1000}
+          disabled={isReviewing}
+          placeholder="Explain the evidence and why this decision should be approved or rejected..."
+          aria-describedby={`${reasonInputId}-help`}
+          onChange={(event) => setReviewReasons((current) => ({
+            ...current,
+            [page.id]: event.target.value,
+          }))}
+        />
+        <div className="cc-review-reason-meta" id={`${reasonInputId}-help`}>
+          <span>At least 20 characters. Maximum 1,000.</span>
+          <span className={reasonValid ? 'valid' : ''}>{reasonLength}/1000</span>
+        </div>
+        <div className="cc-review-actions">
+          <button className="cc-review-button approve" disabled={isReviewing || !reasonValid} onClick={() => updateReview(page.id, 'approved')}>
+            {isReviewing ? 'Saving...' : 'Approve decision'}
+          </button>
+          <button className="cc-review-button reject" disabled={isReviewing || !reasonValid} onClick={() => updateReview(page.id, 'rejected')}>
+            Reject candidate
+          </button>
+          {page.reviewStatus !== 'needs-review' && (
+            <button className="cc-review-button reopen" disabled={isReviewing} onClick={() => updateReview(page.id, 'needs-review')}>
+              Reopen
+            </button>
+          )}
+          <button
+            className="cc-review-button history-toggle"
+            disabled={historyLoading}
+            aria-expanded={historyOpen}
+            onClick={() => toggleReviewHistory(page.id)}
+          >
+            {historyLoading ? 'Loading history...' : historyOpen ? 'Hide audit history' : 'View audit history'}
+          </button>
+        </div>
+        {historyOpen && (
+          <section className="cc-review-history" aria-label={`Review history for ${page.title}`}>
+            <div className="cc-review-history-head">
+              <strong>IMMUTABLE REVIEW HISTORY</strong>
+              {history?.currentSourceVersion && <span>Current page version {history.currentSourceVersion}</span>}
+            </div>
+            {historyErrors[page.id] && <div className="cc-review-history-error">{historyErrors[page.id]}</div>}
+            {historyLoading && !history && <p className="cc-review-history-empty">Loading review events...</p>}
+            {history && history.events.length === 0 && !historyLoading && (
+              <p className="cc-review-history-empty">No review events have been recorded for this decision.</p>
+            )}
+            {history?.events?.length > 0 && (
+              <ol className="cc-review-history-list">
+                {history.events.map((event) => (
+                  <li className="cc-review-history-event" key={event.eventId}>
+                    <div className="cc-review-history-event-top">
+                      <span className={`cc-history-status ${event.status}`}>{event.status.replace('-', ' ')}</span>
+                      <strong>Revision {event.revision}</strong>
+                      <time dateTime={event.reviewedAt}>{new Date(event.reviewedAt).toLocaleString()}</time>
+                    </div>
+                    <div className="cc-review-history-meta">
+                      <span>Source version {event.sourceVersion}{event.sourceVersion === history.currentSourceVersion ? ' · current' : ' · older source version'}</span>
+                      <span>Reviewer {String(event.reviewerAccountId ?? '').slice(0, 10)}…</span>
+                    </div>
+                    <p>{event.reason}</p>
+                  </li>
+                ))}
+              </ol>
+            )}
+            {history?.hasMore && (
+              <button
+                className="cc-review-history-more"
+                disabled={historyLoading}
+                onClick={() => loadReviewHistory(page.id, history.nextCursor)}
+              >
+                {historyLoading ? 'Loading...' : 'Load older events'}
+              </button>
+            )}
+          </section>
+        )}
+      </div>
+    );
+  };
 
   const heading = activeSection === 'sources'
     ? 'Decision sources'
