@@ -1,0 +1,83 @@
+modules:
+  jira:issuePanel:
+    - key: decisiontrace-hello-world-panel
+      resource: main
+      resolver:
+        function: resolver
+      viewportSize: medium
+      title: DecisionTrace
+      icon: https://developer.atlassian.com/platform/forge/images/issue-panel-icon.svg
+
+  macro:
+    - key: decisiontrace-register-macro
+      resource: main
+      resolver:
+        function: resolver
+      viewportSize: large
+      title: DecisionTrace Register
+
+  confluence:globalPage:
+    - key: decisiontrace-command-center
+      resource: main
+      resolver:
+        function: resolver
+      route: decision-center
+      title: DecisionTrace Command Center
+
+  function:
+    - key: resolver
+      handler: index.handler
+    - key: dt-validity-check
+      handler: index.checkDecisionValidity
+
+  rovo:agent:
+    - key: decisiontrace-guardrail-agent
+      name: DecisionTrace Guardrail
+      description: Checks Jira work against approved decisions.
+      prompt: >-
+        You are a read-only Jira decision guardrail. Use the Check decision validity action. Report returned evidence and distinguish approved, superseded, and unverified decisions. Phrase matches are signals, not proof. Never change Jira or Confluence.
+      conversationStarters:
+        - Check this Jira issue against approved decisions.
+        - Is this issue tied to a superseded decision?
+        - Show the evidence behind this decision check.
+      actions:
+        - decisiontrace-check-validity
+      followUpPrompt: Inspect the quoted evidence or review the source decision.
+  action:
+    - key: decisiontrace-check-validity
+      name: Check decision validity
+      function: dt-validity-check
+      actionVerb: GET
+      description: >-
+        Read a Jira issue and compare its text with Confluence decision claims and saved review and supersession status. Return quoted evidence and a cautious validity signal. Never modify Jira or Confluence.
+      inputs:
+        issueKey:
+          title: Jira issue key
+          type: string
+          required: false
+          description: Optional Jira key. Uses the current Jira issue context when available.
+resources:
+  - key: main
+    path: static/hello-world/build
+
+permissions:
+  scopes:
+    - read:jira-work
+    - read:confluence-content.all
+    - read:confluence-space.summary
+    - search:confluence
+    - storage:app
+
+app:
+  runtime:
+    name: nodejs24.x
+    memoryMB: 256
+    architecture: arm64
+
+  compatibility:
+    jira:
+      required: true
+    confluence:
+      required: false
+
+  id: ari:cloud:ecosystem::app/ecf0a216-6e48-49ef-b6d6-f169dd7488ce
